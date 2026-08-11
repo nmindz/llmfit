@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.10](https://github.com/AlexsJones/llmfit/compare/v1.1.9...v1.1.10) (2026-08-11)
+
+
+### Bug Fixes
+
+* expose MiniMax M3 vision capability ([#793](https://github.com/AlexsJones/llmfit/issues/793)) ([4801d4a](https://github.com/AlexsJones/llmfit/commit/4801d4a75b175aeab264806b3bb82ff7436f54ce))
+* **ollama:** stop one sized install marking a whole model family installed ([#863](https://github.com/AlexsJones/llmfit/issues/863)) ([c9a5678](https://github.com/AlexsJones/llmfit/commit/c9a567883e7827dcaa2230af027a5e8cc4b400ae))
+
 ## [1.1.9](https://github.com/AlexsJones/llmfit/compare/v1.1.8...v1.1.9) (2026-08-09)
 
 
