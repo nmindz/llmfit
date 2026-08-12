@@ -194,24 +194,6 @@ impl Fuzz {
         }
     }
 
-    /// One step looser; past [`Fuzz::MAX`] this becomes [`Fuzz::Unlimited`].
-    pub fn looser(self) -> Self {
-        match self {
-            Fuzz::Unlimited => Fuzz::Unlimited,
-            Fuzz::MaxSpan(n) if n >= Self::MAX => Fuzz::Unlimited,
-            Fuzz::MaxSpan(n) => Fuzz::MaxSpan(n + 1),
-        }
-    }
-
-    /// One step tighter; [`Fuzz::Unlimited`] steps down to [`Fuzz::MAX`].
-    pub fn tighter(self) -> Self {
-        match self {
-            Fuzz::Unlimited => Fuzz::MaxSpan(Self::MAX),
-            Fuzz::MaxSpan(n) if n <= Self::MIN => Fuzz::MaxSpan(Self::MIN),
-            Fuzz::MaxSpan(n) => Fuzz::MaxSpan(n - 1),
-        }
-    }
-
     /// Label for the search box and status bar.
     pub fn label(self) -> String {
         match self {
@@ -890,14 +872,6 @@ mod tests {
         // --fuzz 4 is legal but not a rung; cycling moves to the next one up.
         assert_eq!(Fuzz::MaxSpan(4).cycle(), Fuzz::MaxSpan(5));
         assert_eq!(Fuzz::MaxSpan(7).cycle(), Fuzz::Unlimited);
-    }
-
-    #[test]
-    fn fuzz_steps_saturate_at_both_ends() {
-        assert_eq!(Fuzz::MaxSpan(Fuzz::MIN).tighter(), Fuzz::MaxSpan(Fuzz::MIN));
-        assert_eq!(Fuzz::MaxSpan(Fuzz::MAX).looser(), Fuzz::Unlimited);
-        assert_eq!(Fuzz::Unlimited.looser(), Fuzz::Unlimited);
-        assert_eq!(Fuzz::Unlimited.tighter(), Fuzz::MaxSpan(Fuzz::MAX));
     }
 
     #[test]

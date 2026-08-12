@@ -2270,16 +2270,6 @@ impl App {
         self.set_fuzz(self.fuzz.cycle());
     }
 
-    /// Loosen the fuzzy tightness by one step (more, sloppier matches).
-    pub fn loosen_fuzz(&mut self) {
-        self.set_fuzz(self.fuzz.looser());
-    }
-
-    /// Tighten the fuzzy tightness by one step (fewer, closer matches).
-    pub fn tighten_fuzz(&mut self) {
-        self.set_fuzz(self.fuzz.tighter());
-    }
-
     pub fn set_fuzz(&mut self, fuzz: Fuzz) {
         self.fuzz = fuzz;
         self.selected_row = 0;
