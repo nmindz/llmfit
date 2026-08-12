@@ -1021,6 +1021,17 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         // Search
         KeyCode::Char('/') => app.enter_search(),
 
+        // Cycle how the query is interpreted (smart/substring/fuzzy/regex).
+        // Reachable without entering search mode so the indicator can be set
+        // before typing.
+        KeyCode::Tab => app.cycle_search_mode(),
+        KeyCode::BackTab => app.cycle_search_mode_back(),
+
+        // Fuzzy tightness. Ctrl+letter is the only chord terminals transmit
+        // reliably (Ctrl with punctuation often produces no event at all), and
+        // a single cycling key keeps it typable inside the search box.
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cycle_fuzz(),
+
         // Fit filter
         KeyCode::Char('f') => app.cycle_fit_filter(),
 
@@ -1171,6 +1182,16 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
 
         KeyCode::Left => app.search_cursor_left(),
         KeyCode::Right => app.search_cursor_right(),
+
+        // Tab is not a text character, so it is free to cycle the match mode
+        // without interrupting typing.
+        KeyCode::Tab => app.cycle_search_mode(),
+        KeyCode::BackTab => app.cycle_search_mode_back(),
+
+        // Same Ctrl-F cycle as every other mode — and the one the Search
+        // status hint advertises. Ctrl+letter is the only chord terminals
+        // transmit reliably; Ctrl with punctuation often produces no event.
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cycle_fuzz(),
 
         KeyCode::Char(c) if allows_search_text_input(key.modifiers) => app.search_input(c),
 
@@ -1639,6 +1660,9 @@ fn handle_benchmarks_mode(app: &mut App, key: KeyEvent) {
             KeyCode::Backspace => app.bench_search_backspace(),
             KeyCode::Up => app.bench_move_up(),
             KeyCode::Down => app.bench_move_down(),
+            KeyCode::Tab => app.cycle_search_mode(),
+            KeyCode::BackTab => app.cycle_search_mode_back(),
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cycle_fuzz(),
             KeyCode::Char(c) if allows_search_text_input(key.modifiers) => {
                 app.bench_search_input(c)
             }
@@ -1656,6 +1680,9 @@ fn handle_benchmarks_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') => app.bench_move_down(),
         KeyCode::Char('r') => app.bench_refresh(),
         KeyCode::Char('H') => app.open_bench_hw_picker(),
+        KeyCode::Tab => app.cycle_search_mode(),
+        KeyCode::BackTab => app.cycle_search_mode_back(),
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cycle_fuzz(),
         _ => {}
     }
 }
@@ -1666,28 +1693,28 @@ mod tests {
     use crate::tui_app::PlanField;
     use llmfit_core::hardware::{GpuBackend, SystemSpecs};
 
+    fn test_specs() -> SystemSpecs {
+        SystemSpecs {
+            total_ram_gb: 16.0,
+            available_ram_gb: 12.0,
+            total_cpu_cores: 8,
+            cpu_name: "Test CPU".to_string(),
+            has_gpu: false,
+            gpu_vram_gb: None,
+            total_gpu_vram_gb: None,
+            gpu_available_gb: None,
+            gpu_name: None,
+            gpu_count: 0,
+            unified_memory: false,
+            backend: GpuBackend::CpuX86,
+            gpus: Vec::new(),
+            cluster_mode: false,
+            cluster_node_count: 0,
+        }
+    }
+
     fn plan_mode_app() -> App {
-        let mut app = App::with_specs_context_and_config(
-            SystemSpecs {
-                total_ram_gb: 16.0,
-                available_ram_gb: 12.0,
-                total_cpu_cores: 8,
-                cpu_name: "Test CPU".to_string(),
-                has_gpu: false,
-                gpu_vram_gb: None,
-                total_gpu_vram_gb: None,
-                gpu_available_gb: None,
-                gpu_name: None,
-                gpu_count: 0,
-                unified_memory: false,
-                backend: GpuBackend::CpuX86,
-                gpus: Vec::new(),
-                cluster_mode: false,
-                cluster_node_count: 0,
-            },
-            None,
-            None,
-        );
+        let mut app = App::with_specs_context_and_config(test_specs(), None, None);
         app.input_mode = InputMode::Plan;
         app.show_plan = true;
         app
@@ -2010,7 +2037,7 @@ mod tests {
                 let ascending = app.table_sort_is_ascending();
                 let p = rendered_position_in(&mut app, area, label, y..y + 1);
                 assert!(click_at(&mut app, area, p.x, p.y));
-                assert_eq!(app.sorted_table_column(), column);
+                assert_eq!(app.sorted_table_column(), Some(column));
                 if toggle == 1 {
                     assert_ne!(
                         app.table_sort_is_ascending(),
@@ -2667,6 +2694,45 @@ mod tests {
         assert_eq!(app.input_mode, InputMode::Plan, "plan must stay open");
         assert_eq!(app.plan_field, PlanField::KvQuant, "field must not change");
         assert_eq!(app.plan_kv_quant_input, "q4_kj");
+    }
+
+    #[test]
+    fn ctrl_f_cycles_fuzz_in_every_mode_that_advertises_it() {
+        // The Search-mode status hint promises Ctrl-F, so the binding must
+        // actually exist there — it once did not, because the two identical
+        // key blocks were patched with a replace-first-only edit.
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        for mode in [InputMode::Normal, InputMode::Search, InputMode::Benchmarks] {
+            let mut app = App::with_specs_context_and_config(test_specs(), None, None);
+            app.input_mode = mode;
+            let before = app.fuzz;
+            match mode {
+                InputMode::Normal => handle_normal_mode(&mut app, ctrl_f),
+                InputMode::Search => handle_search_mode(&mut app, ctrl_f),
+                InputMode::Benchmarks => handle_benchmarks_mode(&mut app, ctrl_f),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                app.fuzz,
+                before.cycle(),
+                "Ctrl-F did not cycle fuzz in {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_f_does_not_leak_into_the_search_query() {
+        let mut app = App::with_specs_context_and_config(test_specs(), None, None);
+        app.input_mode = InputMode::Search;
+        // App::with_specs_context_and_config restores the developer's real
+        // filters.json, so start from a known-empty query.
+        app.search_query.clear();
+        app.cursor_position = 0;
+        handle_search_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        );
+        assert!(app.search_query.is_empty(), "Ctrl-F must not type an 'f'");
     }
 
     #[test]

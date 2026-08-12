@@ -207,6 +207,12 @@ struct ModelsQuery {
     use_case: Option<String>,
     provider: Option<String>,
     search: Option<String>,
+    /// How `search` is interpreted: `smart` (default), `substring`, `fuzzy` or
+    /// `regex`.
+    #[serde(alias = "mode")]
+    search_mode: Option<String>,
+    /// Fuzzy tightness for `smart`/`fuzzy`: `1`-`9` or `off`.
+    fuzz: Option<String>,
     sort: Option<String>,
     include_too_tight: Option<bool>,
     max_context: Option<u32>,
@@ -1146,6 +1152,9 @@ fn filtered_fits(
     };
     let runtime_filter = parse_runtime(query.runtime.as_deref())?;
     let use_case_filter = parse_use_case(query.use_case.as_deref())?;
+    let search_mode = serve_shared::parse_search_mode(query.search_mode.as_deref())
+        .map_err(ApiError::bad_request)?;
+    let fuzz = serve_shared::parse_fuzz(query.fuzz.as_deref()).map_err(ApiError::bad_request)?;
 
     let context_limit = query.max_context.or(state.context_limit);
     let forced_rt = parse_force_runtime(query.force_runtime.as_deref())?;
@@ -1167,7 +1176,13 @@ fn filtered_fits(
     }
 
     if let Some(search) = query.search.as_ref() {
-        retain_search(&mut fits, search);
+        // An unusable pattern is a client error here: unlike the TUI there is
+        // no on-screen indicator, so silently returning smart-matched results
+        // would misrepresent them as regex matches.
+        if let Some(err) = serve_shared::retain_search_matches(&mut fits, search, search_mode, fuzz)
+        {
+            return Err(ApiError::bad_request(format!("invalid regex: {err}")));
+        }
     }
 
     if query.perfect.unwrap_or(false) {
@@ -1201,7 +1216,15 @@ fn filtered_fits(
         fits.retain(|f| f.fit_level != FitLevel::TooTight);
     }
 
-    Ok(rank_models_by_fit_opts_col(fits, false, sort_column))
+    let mut ranked = rank_models_by_fit_opts_col(fits, false, sort_column);
+    // Relevance orders by match quality, so it runs last — after every filter
+    // and after the column sort, which it replaces.
+    if sort_column == SortColumn::Relevance
+        && let Some(search) = query.search.as_ref()
+    {
+        serve_shared::sort_by_relevance(&mut ranked, search, search_mode, fuzz);
+    }
+    Ok(ranked)
 }
 
 /// Every rankable model analyzed against `specs`, with measured throughput
@@ -1242,20 +1265,6 @@ fn analyze_sweep(
         fits.retain(|f| !f.model.is_mlx_only());
     }
     Some(fits)
-}
-
-fn retain_search(fits: &mut Vec<ModelFit>, search: &str) {
-    let search_lower = search.to_lowercase();
-    fits.retain(|f| {
-        f.model.name.to_lowercase().contains(&search_lower)
-            || f.model.provider.to_lowercase().contains(&search_lower)
-            || f.model
-                .parameter_count
-                .to_lowercase()
-                .contains(&search_lower)
-            || f.model.use_case.to_lowercase().contains(&search_lower)
-            || f.use_case.label().to_lowercase().contains(&search_lower)
-    });
 }
 
 /// The `llmfit storage --search` scope: name, provider or parameter count
@@ -1322,6 +1331,7 @@ fn parse_sort(raw: Option<&str>) -> Result<SortColumn, ApiError> {
     let value = raw.unwrap_or("score").trim().to_lowercase();
     let sort = match value.as_str() {
         "score" => SortColumn::Score,
+        "relevance" | "match" | "best" => SortColumn::Relevance,
         "tps" | "tokens" | "throughput" => SortColumn::Tps,
         "params" | "parameters" => SortColumn::Params,
         "mem" | "memory" | "mem_pct" | "utilization" => SortColumn::MemPct,
@@ -1330,7 +1340,7 @@ fn parse_sort(raw: Option<&str>) -> Result<SortColumn, ApiError> {
         "use" | "use_case" | "usecase" => SortColumn::UseCase,
         _ => {
             return Err(ApiError::bad_request(
-                "invalid sort value: use score|tps|params|mem|ctx|date|use_case",
+                "invalid sort value: use score|relevance|tps|params|mem|ctx|date|use_case",
             ));
         }
     };
@@ -1613,6 +1623,95 @@ mod tests {
             .build()
             .expect("tokio runtime")
             .block_on(future)
+    }
+
+    /// GET the path and parse the JSON body.
+    fn get_ok_json(uri: &str) -> serde_json::Value {
+        run_async(async {
+            let response = test_router()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice(&bytes).expect("valid JSON")
+        })
+    }
+
+    fn model_names(json: &serde_json::Value) -> Vec<String> {
+        json["models"]
+            .as_array()
+            .expect("models array")
+            .iter()
+            .map(|m| m["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn relevance_sort_reorders_without_dropping_any_filter() {
+        // Regression: ranking used to return early, skipping every filter
+        // after the search — use_case, min_fit, license, too-tight and the
+        // rest were silently ignored whenever sort=relevance was requested.
+        let base = "/api/v1/models?search=qwen&search_mode=fuzzy&use_case=coding&min_fit=marginal&limit=100000";
+        let by_score = get_ok_json(&format!("{base}&sort=score"));
+        let by_relevance = get_ok_json(&format!("{base}&sort=relevance"));
+
+        let mut a = model_names(&by_score);
+        let mut b = model_names(&by_relevance);
+        assert!(!a.is_empty(), "fixture query should match something");
+        assert_eq!(
+            by_score["total_models"], by_relevance["total_models"],
+            "relevance must not change which rows pass the filters"
+        );
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "same result set, only the order may differ");
+    }
+
+    #[test]
+    fn relevance_sort_puts_a_better_match_first() {
+        let json =
+            get_ok_json("/api/v1/models?search=qw3c&search_mode=fuzzy&sort=relevance&limit=5");
+        let names = model_names(&json);
+        assert!(!names.is_empty());
+        assert!(
+            names[0].to_lowercase().contains("qwen3-coder"),
+            "top hit should be the best match, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn fuzz_parameter_tightens_the_result_set() {
+        let total = |fuzz: &str| -> u64 {
+            get_ok_json(&format!(
+                "/api/v1/models?search=qw3c&search_mode=fuzzy&fuzz={fuzz}&limit=1"
+            ))["total_models"]
+                .as_u64()
+                .expect("total_models")
+        };
+        let tight = total("2");
+        let loose = total("off");
+        assert!(tight > 0, "fuzz=2 should still match something");
+        assert!(
+            tight < loose,
+            "tighter fuzz must not match more: {tight} vs {loose}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_fuzz_is_rejected() {
+        run_async(async {
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/models?search=x&fuzz=99")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        });
     }
 
     #[test]

@@ -177,6 +177,32 @@ The scraper has hardcoded fallback entries for gated models that require authent
 4. Add the UI widget in `tui_ui.rs` (`draw_search_and_filters()` function).
 5. Update the status bar help text in `draw_status_bar()`.
 
+## Search matching
+
+All free-text search goes through `llmfit-core/src/search.rs`
+(`SearchMode` + `Matcher`). Do not hand-roll another substring or subsequence
+matcher: `apply_filters()`, `bench_visible_indices()`, `find_model_with_mode()`,
+the HTTP `?search=` filter and the MCP `search_models` tool all share it, and
+divergence between them is the bug this module exists to prevent.
+
+- Build the `Matcher` **once per query**, outside the row loop — compiling a
+  regex per row is the performance trap here.
+- Fuzzy matching is capped by `Fuzz` (default: a match may span at most 3x the
+  term length). Without that cap a 4-char query matches ~6% of the catalog.
+  The cap can never reject a contiguous match, which is what keeps `Smart` a
+  superset of `Substring`.
+- `score_fields` is the ranking counterpart of `matches_fields` and the two
+  must agree on *whether* a row matches — there is a test that asserts this.
+  Score only when actually ranking; it is the more expensive call.
+- Pass fields separately to `matches_fields()` rather than concatenating them.
+  Per-field matching is what makes regex anchors and subsequence queries mean
+  something; against one joined blob, `^`/`$` are useless and a fuzzy query
+  matches almost everything.
+- An invalid regex is not an error state to propagate into the TUI. `Matcher`
+  reports it via `error()` and filters nothing, so a half-typed pattern never
+  blanks the table. Non-interactive callers (CLI, HTTP, MCP) do the opposite
+  and fail loudly, because they have no place to show a warning.
+
 ## Adding a new CLI subcommand
 
 1. Add a variant to the `Commands` enum in `main.rs`.

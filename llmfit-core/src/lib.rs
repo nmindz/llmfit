@@ -11,6 +11,7 @@ pub mod models;
 pub mod plan;
 pub mod providers;
 pub mod quality;
+pub mod search;
 pub mod share;
 pub mod storage;
 pub mod task_bench;
@@ -31,6 +32,7 @@ pub use plan::{
 pub use providers::{
     LlamaCppProvider, LmStudioProvider, MlxProvider, ModelProvider, OllamaProvider, VllmProvider,
 };
+pub use search::{Matcher, SearchMode};
 pub use update::{
     UpdateOptions, cache_file, clear_cache, load_cache, save_cache, update_model_cache,
 };

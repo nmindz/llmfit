@@ -160,6 +160,13 @@ impl InferenceRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn {
     Score,
+    /// Best match for the active search query first.
+    ///
+    /// Scores come from `search::Matcher` and therefore depend on the query,
+    /// which `rank_models_by_fit_opts_col` has no access to — it treats this
+    /// as `Score`. Callers that hold the query (the TUI's `apply_filters`,
+    /// `find_model_ranked`) do the real relevance ordering themselves.
+    Relevance,
     Tps,
     Params,
     MemPct,
@@ -173,6 +180,7 @@ impl SortColumn {
     pub fn label(&self) -> &str {
         match self {
             SortColumn::Score => "Score",
+            SortColumn::Relevance => "Match",
             SortColumn::Tps => "tok/s",
             SortColumn::Params => "Params",
             SortColumn::MemPct => "Mem%",
@@ -186,7 +194,8 @@ impl SortColumn {
     pub fn next(&self) -> Self {
         match self {
             SortColumn::Params => SortColumn::Score,
-            SortColumn::Score => SortColumn::Tps,
+            SortColumn::Score => SortColumn::Relevance,
+            SortColumn::Relevance => SortColumn::Tps,
             SortColumn::Tps => SortColumn::MemPct,
             SortColumn::MemPct => SortColumn::Ctx,
             SortColumn::Ctx => SortColumn::ReleaseDate,
@@ -1327,7 +1336,9 @@ pub fn rank_models_by_fit_opts_col_dir(
         // Sort by selected column. Each arm compares in the column's default
         // orientation; `dir` flips it when ascending was requested.
         let by_column = match sort_column {
-            SortColumn::Score => dir(b
+            // No query here, so fall back to the composite score; see the
+            // doc comment on SortColumn::Relevance.
+            SortColumn::Score | SortColumn::Relevance => dir(b
                 .score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)),

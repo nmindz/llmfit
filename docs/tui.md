@@ -15,7 +15,9 @@ Launches the interactive terminal UI. Your system specs (CPU, RAM, GPU name, VRA
 | Key                        | Action                                                                |
 |----------------------------|-----------------------------------------------------------------------|
 | `Up` / `Down` or `j` / `k` | Navigate models                                                       |
-| `/`                        | Enter search mode (partial match on name, provider, params, use case) |
+| `/`                        | Enter search mode (matches name, provider, params, use case)          |
+| `Tab` / `Shift-Tab`        | Cycle search mode: smart, substring, fuzzy, regex                     |
+| `Ctrl-F`                   | Cycle fuzzy tightness: 1, 2, 3, 5, off                                |
 | `Esc` or `Enter`           | Exit search mode                                                      |
 | `Ctrl-U`                   | Clear search                                                          |
 | `f`                        | Cycle fit filter: All, Runnable, Perfect, Good, Marginal              |
@@ -50,6 +52,83 @@ Launches the interactive terminal UI. Your system specs (CPU, RAM, GPU name, VRA
 ### Mouse navigation
 
 Click a model row to select it; double-click to open details. Use the mouse wheel or scrollbar to scroll without changing selection. Keyboard navigation brings the selected row back into view. Click a column header to sort; click again to reverse direction. Search/filter boxes, hotkey hints, checkbox options and editable fields also accept clicks.
+
+### Search modes
+
+The `/` search box interprets your query one of four ways. `Tab` cycles forward,
+`Shift-Tab` backward; the active mode is shown in the box title (`Search [re]`)
+and the choice is saved to `filters.json` for the next run.
+
+| Mode        | Query `qw3c` matches | Meaning                                                       |
+|-------------|----------------------|---------------------------------------------------------------|
+| `smart`     | yes                  | Each term is a substring **or** an in-order subsequence. Default. |
+| `substring` | no                   | Each term must appear verbatim. The pre-1.2 behaviour.        |
+| `fuzzy`     | yes                  | Each term must be an in-order subsequence, e.g. `qw3c` → `Qwen3-Coder`. |
+| `regex`     | no (literal)         | The whole query is one case-insensitive regular expression.   |
+
+Details that matter in practice:
+
+- **Terms are ANDed, fields are ORed.** `llama meta` finds a Llama model whose
+  provider is Meta. A single term never matches by straddling two columns.
+- **Anchors bind to a field, not to the row.** In regex mode `^gemma` matches
+  models whose *name* starts with `gemma`, and `-7b$` matches those whose name
+  ends in `-7b`.
+- **Regex mode does not split on whitespace.** A space is a literal character;
+  use `|` for alternation.
+- **A half-typed pattern never hides rows.** While `^(qwen|` is incomplete the
+  search filter is simply not applied, and the status bar shows
+  `⚠ invalid regex: …`. Other filters keep working.
+- **`smart` never loses results.** It matches everything `substring` matches,
+  plus gapped queries.
+
+The same mode drives the Community Leaderboard's `/` search.
+
+#### Controlling fuzziness
+
+A subsequence match can be arbitrarily spread out, which on a 10,000-model
+catalog matches far too much. The **tightness** knob caps how far apart a
+match may be: a term of N characters may span at most `fuzz x N` characters.
+`Ctrl-F` cycles 1 → 2 → 3 → 5 → off.
+
+| `--fuzz` | Meaning | Hits for `qw3c` |
+|---|---|---|
+| `1` | Contiguous only — no gaps at all | 0 |
+| `2` | Tight | 64 |
+| `3` | **Default** | 116 |
+| `5` | Loose | 399 |
+| `off` | No limit — a plain subsequence | 615 |
+
+`3` is the default because it keeps every intended abbreviation
+(`qw3c` → Qwen3-Coder, `gm7` → gemma-7b, `llm8` → llama-3.1-8b) while cutting
+incidental matches roughly fivefold. `2` is tighter but already loses
+`gm7` → `gemma-7b`.
+
+Tightness only applies to gapped matching, so it appears in the search box
+only in `smart` and `fuzzy` mode (`Search [fuzzy 3]`). **No tightness setting
+can ever hide a result that `substring` would have found** — a contiguous
+match spans exactly its own length, so it passes even at `1`.
+
+#### Ranking by match quality
+
+Press `s` until the sort column reads **Match** to order results best-first
+instead of by hardware-fit score. Scoring prefers, in order: a whole-field
+match, a prefix, a substring, then a gapped match — tighter over looser — and
+weights the model name above the provider and other columns.
+
+Installed-first and unrunnable-last still apply; relevance orders rows within
+those groups. With no query, the Match column changes nothing.
+
+```sh
+llmfit --search-mode fuzzy --fuzz 2 search qw3c   # tighter
+LLMFIT_FUZZ=off llmfit                            # no limit, in the TUI
+```
+
+To set the mode without opening the TUI:
+
+```sh
+llmfit --search-mode regex              # launch the TUI in regex mode
+LLMFIT_SEARCH_MODE=fuzzy llmfit         # same, via environment
+```
 
 ### Vim-like modes
 
@@ -199,6 +278,9 @@ Where numbers disagree, llmfit trusts: your own runs > llmfit community on ident
 | Key                    | Action                                  |
 |------------------------|-----------------------------------------|
 | `j` / `k` or arrows   | Navigate results                        |
+| `/`                    | Search results                          |
+| `Tab` / `Shift-Tab`   | Cycle search mode (shared with the model table) |
+| `Ctrl-F`               | Cycle fuzzy tightness                   |
 | `H`                    | Open hardware picker (browse any GPU)   |
 | `r`                    | Refresh / re-fetch from API             |
 | `b` / `q` / `Esc`     | Close and return to model table         |

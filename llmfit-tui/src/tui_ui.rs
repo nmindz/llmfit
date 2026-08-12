@@ -543,6 +543,28 @@ fn floor_grapheme_boundary(value: &str, index: usize) -> usize {
     index
 }
 
+/// Whether the shared search box is currently showing the leaderboard's `/`
+/// query rather than the model table's. Both the search box and the status bar
+/// must agree, or they would report errors for two different queries.
+fn showing_bench_search(app: &App) -> bool {
+    app.input_mode == InputMode::Benchmarks
+        && (app.bench_search_active || !app.bench_search_query.is_empty())
+}
+
+/// The regex error for whichever query is on screen, or `None`.
+///
+/// Recomputed per frame rather than cached on `App`: the alternative is
+/// invalidating a stored copy from every site that edits a query or switches
+/// mode, and one missed site would leave a stale warning on screen. Compiling
+/// a short pattern costs tens of microseconds, only in regex mode.
+fn active_search_error(app: &App) -> Option<String> {
+    if showing_bench_search(app) {
+        app.bench_search_error()
+    } else {
+        app.search_error.clone()
+    }
+}
+
 pub(crate) fn search_and_filter_layout(area: Rect) -> [Rect; 9] {
     Layout::default()
         .direction(Direction::Horizontal)
@@ -564,8 +586,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     let chunks = search_and_filter_layout(area);
 
     // Search box — in the leaderboard view it shows the `/` benchmark search
-    let bench_search = app.input_mode == InputMode::Benchmarks
-        && (app.bench_search_active || !app.bench_search_query.is_empty());
+    let bench_search = showing_bench_search(app);
     let search_style = if bench_search && app.bench_search_active {
         Style::default().fg(tc.accent_secondary)
     } else {
@@ -603,6 +624,13 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     let (visible_query, cursor_offset) =
         visible_search_query(query, query_cursor, search_inner_width);
 
+    // An unparseable regex applies no filter at all; the warning colour here
+    // and the message in the status bar are what make that visible.
+    let search_error = active_search_error(app);
+
+    // The query itself always stays on screen — the user is mid-edit and needs
+    // to see it, and the cursor is positioned against it. The message goes to
+    // the full-width status bar, which has room for it.
     let search_text = if app.search_query.is_empty() && app.input_mode == InputMode::Normal {
         Line::from(Span::styled(
             "Press / to search...",
@@ -612,11 +640,27 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         Line::from(Span::styled(visible_query, Style::default().fg(tc.fg)))
     };
 
+    // Only show the tightness when the active mode actually uses it —
+    // substring and regex have no gapped matching to loosen.
+    let mode_badge = if app.fuzz_is_active() {
+        format!("{} {}", app.search_mode.short_label(), app.fuzz.label())
+    } else {
+        app.search_mode.short_label().to_string()
+    };
+    let (title_style, title) = if search_error.is_some() {
+        (
+            Style::default().fg(tc.error),
+            format!(" Search [{}] ⚠ ", mode_badge),
+        )
+    } else {
+        (search_style, format!(" Search [{}] ", mode_badge))
+    };
+
     let search_block = Block::default()
         .borders(Borders::ALL)
         .border_style(search_style)
-        .title(" Search ")
-        .title_style(search_style);
+        .title(title)
+        .title_style(title_style);
 
     let search = Paragraph::new(search_text).block(search_block);
     frame.render_widget(search, chunks[0]);
@@ -1023,7 +1067,7 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                     .bg(tc.accent_secondary)
                     .add_modifier(Modifier::BOLD),
             )
-        } else if sort_col_idx == i {
+        } else if sort_col_idx == Some(i) {
             let arrow = if app.table_sort_is_ascending() {
                 "▲"
             } else {
@@ -3389,10 +3433,20 @@ pub(crate) fn status_keys_and_mode(app: &App) -> (String, String) {
                 "SELECT".to_string(),
             )
         }
-        InputMode::Search => (
-            "  Type to search  Esc:done  Ctrl-U:clear".to_string(),
-            "SEARCH".to_string(),
-        ),
+        InputMode::Search => {
+            let fuzz = if app.fuzz_is_active() {
+                format!("  Ctrl-F:fuzz [{}]", app.fuzz)
+            } else {
+                String::new()
+            };
+            (
+                format!(
+                    "  Type to search  Tab:mode [{}]{}  Esc:done  Ctrl-U:clear",
+                    app.search_mode, fuzz
+                ),
+                "SEARCH".to_string(),
+            )
+        }
         InputMode::Plan => (
             "  Tab/↑↓:field  ←/→:cursor  type:edit  Backspace/Delete  Ctrl-U:clear  Esc:close"
                 .to_string(),
@@ -3551,6 +3605,26 @@ pub(crate) fn status_key_area(app: &App, area: Rect) -> Rect {
     Rect::new(keys.x + skip, keys.y, keys.width - skip, keys.height)
 }
 
+/// Status-line spans: mode badge, then either the regex error (it displaces
+/// the key hints — a broken pattern is the more urgent thing to read) or the
+/// usual keybinding hints.
+fn status_spans<'a>(app: &App, tc: &ThemeColors, keys: String, mode_text: &str) -> Vec<Span<'a>> {
+    let error = active_search_error(app);
+
+    let mut spans = vec![Span::styled(
+        format!(" {} ", mode_text),
+        Style::default().fg(tc.status_fg).bg(tc.status_bg).bold(),
+    )];
+    match error {
+        Some(err) => spans.push(Span::styled(
+            format!("  ⚠ invalid regex: {} — search filter not applied", err),
+            Style::default().fg(tc.error),
+        )),
+        None => spans.push(Span::styled(keys, Style::default().fg(tc.muted))),
+    }
+    spans
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     let (keys, mode_text) = status_keys_and_mode(app);
 
@@ -3590,13 +3664,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     if let Some(progress_text) = status_progress_text(app) {
         let chunks = status_footer_areas(app, area);
 
-        let status_line = Line::from(vec![
-            Span::styled(
-                format!(" {} ", mode_text),
-                Style::default().fg(tc.status_fg).bg(tc.status_bg).bold(),
-            ),
-            Span::styled(keys, Style::default().fg(tc.muted)),
-        ]);
+        let status_line = Line::from(status_spans(app, tc, keys, &mode_text));
         frame.render_widget(Paragraph::new(status_line), chunks[0]);
 
         let pull_color = if app.pull_active.is_some() {
@@ -3614,13 +3682,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         return;
     }
 
-    let status_line = Line::from(vec![
-        Span::styled(
-            format!(" {} ", mode_text),
-            Style::default().fg(tc.status_fg).bg(tc.status_bg).bold(),
-        ),
-        Span::styled(keys, Style::default().fg(tc.muted)),
-    ]);
+    let status_line = Line::from(status_spans(app, tc, keys, &mode_text));
 
     frame.render_widget(Paragraph::new(status_line), rows[1]);
 }
@@ -4042,7 +4104,22 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         ("  ↓ / j", "Move down"),
         ("  Enter", "Toggle detail view"),
         ("  /", "Search"),
+        // Descriptions are clipped past ~35 columns by the popup width.
+        ("  Tab", "Cycle search mode"),
+        ("  Shift-Tab", "Cycle search mode back"),
+        ("  Ctrl-F", "Cycle fuzzy tightness"),
         ("  Ctrl-U", "Clear search"),
+        ("", ""),
+        ("Search modes", ""),
+        ("  smart", "Substring or gapped (default)"),
+        ("  substring", "Every term verbatim"),
+        ("  fuzzy", "qw3c matches Qwen3-Coder"),
+        ("  regex", "Case-insensitive regex"),
+        ("", ""),
+        ("Fuzzy tightness", ""),
+        ("  1", "Contiguous only"),
+        ("  3", "Default"),
+        ("  off", "Any gap, however wide"),
         ("", ""),
         ("Filters", ""),
         ("  f", "Cycle fit filter"),
@@ -4056,7 +4133,7 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         ("  R", "Runtime/backend filter"),
         ("", ""),
         ("Sorting & Display", ""),
-        ("  s", "Cycle sort column"),
+        ("  s", "Cycle sort column (incl. Match)"),
         ("  i", "Toggle installed-first sort"),
         ("  t", "Cycle theme"),
         ("", ""),

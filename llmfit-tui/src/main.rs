@@ -25,6 +25,7 @@ use llmfit_core::hwprofile::HardwareProfile;
 use llmfit_core::models::{ModelDatabase, matches_provider_filter};
 use llmfit_core::plan::{PlanRequest, estimate_model_plan_with_config, resolve_model_selector};
 use llmfit_core::quality;
+use llmfit_core::search::{Fuzz, SearchMode};
 use llmfit_core::share;
 use llmfit_core::storage::{
     ScratchPolicy, StorageRequest, StorageSelection, estimate_storage, parse_storage_size,
@@ -63,6 +64,9 @@ const DEFAULT_DASHBOARD_PORT: u16 = 8787;
 enum SortArg {
     /// Composite ranking score (default)
     Score,
+    /// Best match for the search text first
+    #[value(alias = "match", alias = "best")]
+    Relevance,
     /// Estimated tokens/second
     #[value(alias = "tokens", alias = "toks", alias = "throughput")]
     Tps,
@@ -89,6 +93,7 @@ impl From<SortArg> for SortColumn {
     fn from(value: SortArg) -> Self {
         match value {
             SortArg::Score => SortColumn::Score,
+            SortArg::Relevance => SortColumn::Relevance,
             SortArg::Tps => SortColumn::Tps,
             SortArg::Params => SortColumn::Params,
             SortArg::Mem => SortColumn::MemPct,
@@ -96,6 +101,41 @@ impl From<SortArg> for SortColumn {
             SortArg::Date => SortColumn::ReleaseDate,
             SortArg::Use => SortColumn::UseCase,
             SortArg::Provider => SortColumn::Provider,
+        }
+    }
+}
+
+/// Aliases mirror `SearchMode::from_str` exactly, so the same spelling works
+/// on the command line, in `filters.json`, on the HTTP API and via MCP.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum SearchModeArg {
+    /// Substring or subsequence per space-separated term (default)
+    #[value(alias = "auto", alias = "default")]
+    Smart,
+    /// Every space-separated term must appear verbatim
+    #[value(
+        alias = "sub",
+        alias = "contains",
+        alias = "exact",
+        alias = "literal",
+        alias = "plain"
+    )]
+    Substring,
+    /// Subsequence per term, e.g. "qw3c" matches "Qwen3-Coder"
+    #[value(alias = "fzf", alias = "subsequence")]
+    Fuzzy,
+    /// Whole query is one case-insensitive regular expression
+    #[value(alias = "re", alias = "regexp", alias = "regular-expression")]
+    Regex,
+}
+
+impl From<SearchModeArg> for SearchMode {
+    fn from(value: SearchModeArg) -> Self {
+        match value {
+            SearchModeArg::Smart => SearchMode::Smart,
+            SearchModeArg::Substring => SearchMode::Substring,
+            SearchModeArg::Fuzzy => SearchMode::Fuzzy,
+            SearchModeArg::Regex => SearchMode::Regex,
         }
     }
 }
@@ -180,7 +220,10 @@ EXIT CODES:
   1  Any error (hardware detection failure, model not found, network error, etc.)
 
 ENVIRONMENT VARIABLES:
-  OLLAMA_CONTEXT_LENGTH  Default context-length cap when --max-context is not set.")]
+  OLLAMA_CONTEXT_LENGTH  Default context-length cap when --max-context is not set.
+  LLMFIT_SEARCH_MODE     Default --search-mode (smart|substring|fuzzy|regex).
+                         An unrecognised value warns and is ignored.
+  LLMFIT_FUZZ            Default --fuzz (1-9 or off). Same warn-and-ignore.")]
 #[command(after_long_help = "For a compact summary, use -h instead of --help.")]
 #[command(version)]
 struct Cli {
@@ -276,6 +319,75 @@ struct Cli {
     /// Falls back to LOCALMAXXING_API_KEY env var.
     #[arg(long, value_name = "KEY", env = "LOCALMAXXING_API_KEY")]
     api_key: Option<String>,
+
+    /// How search queries are interpreted, for `llmfit search` and the TUI's
+    /// `/` box. Left unset, the CLI uses `smart` and the TUI restores the mode
+    /// saved from its last run (cycled in-app with Tab).
+    #[arg(long, value_enum, global = true, value_name = "MODE")]
+    search_mode: Option<SearchModeArg>,
+
+    /// How loose a fuzzy match may be: 1-9, or "off" for no limit.
+    /// A match may span at most N times the length of the search term, so 1 is
+    /// contiguous-only and higher is sloppier. Default 3.
+    /// Only affects the smart and fuzzy modes. Falls back to LLMFIT_FUZZ.
+    #[arg(long, global = true, value_name = "N")]
+    fuzz: Option<String>,
+}
+
+/// Resolves fuzzy tightness from the flag, then `LLMFIT_FUZZ`.
+///
+/// `None` means "not configured", so the TUI keeps whatever it restored from
+/// `filters.json`. A blank env var counts as unset — mirrors
+/// [`resolve_search_mode`], and matters because `env::var().is_ok()` is true
+/// for `LLMFIT_FUZZ=`, which would otherwise silently reset the saved value.
+///
+/// An explicit bad flag is a hard error; a stale env var is a warning.
+fn resolve_fuzz(flag: Option<&str>) -> Option<Fuzz> {
+    if let Some(raw) = flag {
+        match raw.parse::<Fuzz>() {
+            Ok(f) => return Some(f),
+            Err(err) => {
+                eprintln!("{}", err);
+                std::process::exit(1);
+            }
+        }
+    }
+    let raw = std::env::var("LLMFIT_FUZZ").ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    match raw.parse::<Fuzz>() {
+        Ok(f) => Some(f),
+        Err(err) => {
+            eprintln!("Warning: {}. Ignoring LLMFIT_FUZZ.", err);
+            None
+        }
+    }
+}
+
+/// Resolves the search mode from the flag, then `LLMFIT_SEARCH_MODE`.
+///
+/// The env var is parsed here rather than by clap's `env` support so that a
+/// stale or misspelled value degrades to a warning instead of aborting every
+/// invocation — including `llmfit system` and a bare TUI launch, which have
+/// nothing to do with searching. An explicit `--search-mode` typo still fails
+/// loudly via clap, because the user just typed it. Mirrors the existing
+/// handling of LLMFIT_DASHBOARD_PORT.
+fn resolve_search_mode(flag: Option<SearchModeArg>) -> Option<SearchMode> {
+    if let Some(arg) = flag {
+        return Some(arg.into());
+    }
+    let raw = std::env::var("LLMFIT_SEARCH_MODE").ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    match raw.parse::<SearchMode>() {
+        Ok(mode) => Some(mode),
+        Err(err) => {
+            eprintln!("Warning: {}. Ignoring LLMFIT_SEARCH_MODE.", err);
+            None
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -505,19 +617,43 @@ AGENT USAGE:
 Search for specific models.
 
 Searches the embedded model database by name, provider, or parameter size.
-No hardware analysis is performed.
+No hardware analysis is performed. If nothing matches locally, falls back to
+searching HuggingFace for GGUF repositories.
+
+SEARCH MODES (--search-mode, or LLMFIT_SEARCH_MODE):
+  smart      Each space-separated term matches as a substring OR as an
+             in-order subsequence. Default.
+  substring  Each term must appear verbatim.
+  fuzzy      Each term must be an in-order subsequence:
+             'qw3c' matches 'Qwen3-Coder'.
+  regex      The whole query is one case-insensitive regular expression.
+             Whitespace is literal; anchors bind to a single field, so
+             '^llama' matches names starting with llama.
+
+  Terms are ANDed and fields are ORed: 'llama meta' finds a Llama model whose
+  provider is Meta. A term never matches by straddling two fields.
+
+FUZZINESS (--fuzz, or LLMFIT_FUZZ):
+  Caps how far apart a gapped match may be spread: a term of N characters may
+  span at most (fuzz x N) characters. 1 is contiguous-only, 3 is the default,
+  'off' removes the limit. Only affects the smart and fuzzy modes, and can
+  never reject a match that 'substring' would have found.
+
+  Results are ordered best match first.
 
 PRECONDITIONS:
   None.
 
 SIDE EFFECTS:
-  None — read-only.
+  Network request to HuggingFace only when the local database has no match.
 
 EXIT CODES:
   0  Success (even if no matches found)
+  1  --search-mode regex was given an unparseable pattern
 
 AGENT USAGE:
   llmfit search \"qwen\" --json
+  llmfit --search-mode regex search '^llama-3\\.[12]'
 
   JSON output: array of matching model objects, same fields as
   'llmfit list --json'. An empty array when nothing matches locally; the
@@ -2084,8 +2220,10 @@ fn run_tui(
     overrides: &HardwareOverrides,
     context_limit: Option<u32>,
     api_key: Option<String>,
+    search_mode: Option<SearchMode>,
+    fuzz: Option<Fuzz>,
 ) -> std::io::Result<()> {
-    run_tui_inner(overrides, context_limit, api_key, false)
+    run_tui_inner(overrides, context_limit, api_key, search_mode, fuzz, false)
 }
 
 /// Launch the TUI with the live-bench view pre-opened.
@@ -2093,14 +2231,18 @@ fn run_tui_bench(
     overrides: &HardwareOverrides,
     context_limit: Option<u32>,
     api_key: Option<String>,
+    search_mode: Option<SearchMode>,
+    fuzz: Option<Fuzz>,
 ) -> std::io::Result<()> {
-    run_tui_inner(overrides, context_limit, api_key, true)
+    run_tui_inner(overrides, context_limit, api_key, search_mode, fuzz, true)
 }
 
 fn run_tui_inner(
     overrides: &HardwareOverrides,
     context_limit: Option<u32>,
     api_key: Option<String>,
+    search_mode: Option<SearchMode>,
+    fuzz: Option<Fuzz>,
     open_bench: bool,
 ) -> std::io::Result<()> {
     // Setup terminal
@@ -2122,6 +2264,14 @@ fn run_tui_inner(
     let mut app = tui_app::App::with_specs_context_and_config(specs, context_limit, config);
     if api_key.is_some() {
         app.bench_api_key = api_key;
+    }
+    // An explicit --search-mode / LLMFIT_SEARCH_MODE overrides the mode
+    // restored from filters.json; unset means "keep what was saved".
+    if let Some(mode) = search_mode {
+        app.set_search_mode(mode);
+    }
+    if let Some(f) = fuzz {
+        app.set_fuzz(f);
     }
 
     if open_bench {
@@ -3904,6 +4054,10 @@ fn main() {
     configure_llama_cpp_path(cli.llama_cpp_path.as_deref());
 
     let context_limit = resolve_context_limit(cli.max_context);
+    let search_mode: Option<SearchMode> = resolve_search_mode(cli.search_mode);
+    // None = not configured, so the TUI keeps its saved tightness.
+    let tui_fuzz = resolve_fuzz(cli.fuzz.as_deref());
+    let fuzz = tui_fuzz.unwrap_or_default();
     let overrides = HardwareOverrides {
         memory: cli.memory,
         memory_percent: cli.memory_percent,
@@ -3928,7 +4082,13 @@ fn main() {
     // output flags, so a Docker image with a baked-in CMD can still launch
     // the TUI: docker run --rm -it ghcr.io/alexsjones/llmfit --tui
     if cli.tui {
-        if let Err(e) = run_tui(&overrides, context_limit, cli.api_key) {
+        if let Err(e) = run_tui(
+            &overrides,
+            context_limit,
+            cli.api_key,
+            search_mode,
+            tui_fuzz,
+        ) {
             eprintln!("Error running TUI: {}", e);
             std::process::exit(1);
         }
@@ -4050,8 +4210,24 @@ fn main() {
             }
 
             Commands::Search { query } => {
+                let search_mode = search_mode.unwrap_or_default();
+                // The TUI leaves the filter unapplied and shows a warning,
+                // because the user is mid-keystroke. A one-shot CLI run has no
+                // such feedback loop, so it fails loudly instead.
+                if search_mode == SearchMode::Regex
+                    && let Some(err) =
+                        llmfit_core::search::Matcher::new(&query, search_mode).error()
+                {
+                    eprintln!("Invalid regex '{}': {}", query, err);
+                    std::process::exit(1);
+                }
                 let db = ModelDatabase::new();
-                let results = db.find_model(&query);
+                // Best match first — the whole point of a ranked search.
+                let results: Vec<&llmfit_core::models::LlmModel> = db
+                    .find_model_ranked(&query, search_mode, fuzz)
+                    .into_iter()
+                    .map(|(m, _)| m)
+                    .collect();
                 if cli.json {
                     println!(
                         "{}",
@@ -4314,7 +4490,13 @@ fn main() {
                 // No model/flags → launch bench TUI view
                 let is_bare = model.is_none() && !all && !json && !quality && !routing && !share;
                 if is_bare {
-                    if let Err(e) = run_tui_bench(&overrides, context_limit, cli.api_key) {
+                    if let Err(e) = run_tui_bench(
+                        &overrides,
+                        context_limit,
+                        cli.api_key,
+                        search_mode,
+                        tui_fuzz,
+                    ) {
                         eprintln!("Error running bench TUI: {}", e);
                         std::process::exit(1);
                     }
@@ -4373,7 +4555,13 @@ fn main() {
     }
 
     // Default: launch TUI
-    if let Err(e) = run_tui(&overrides, context_limit, cli.api_key) {
+    if let Err(e) = run_tui(
+        &overrides,
+        context_limit,
+        cli.api_key,
+        search_mode,
+        tui_fuzz,
+    ) {
         eprintln!("Error running TUI: {}", e);
         std::process::exit(1);
     }

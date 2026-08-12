@@ -342,7 +342,15 @@ Supported on `/api/v1/models` and `/api/v1/models/top` (also `/api/v1/models/{na
 - `use_case`: `general|coding|reasoning|chat|multimodal|embedding`.
 - `provider`: provider substring filter.
 - `search`: free-text filter (name/provider/params/use-case/category).
-- `sort`: `score|tps|params|mem|ctx|date|use_case`.
+- `search_mode` (alias `mode`): `smart|substring|fuzzy|regex`, default `smart`.
+  `smart` matches each space-separated term as a substring or an in-order
+  subsequence; `regex` treats the whole query as one case-insensitive pattern
+  anchored per field. An unparseable pattern returns HTTP 400.
+- `fuzz`: `1`-`9` or `off`, default `3`. Caps how far apart a fuzzy match may
+  be spread, as a multiple of the search term's length — `1` is contiguous
+  only, `off` removes the limit. Ignored by `substring` and `regex`.
+- `sort`: `score|relevance|tps|params|mem|ctx|date|use_case`. `relevance`
+  (aliases `match`, `best`) orders by match quality against `search`.
 - `include_too_tight`: `true` includes unrunnable (`too_tight`) rows even when `min_fit` is not given; `false` drops them even with `min_fit=too_tight`. With neither parameter, `/models` returns rows from `marginal` up; `/models/top` never returns `too_tight` rows.
 - `max_context`: per-request context cap used by memory estimation.
 - `force_runtime`: `mlx|llamacpp|vllm|bitnetcpp` — override automatic runtime selection during analysis (e.g. get llama.cpp recommendations on Apple Silicon instead of MLX).
@@ -440,7 +448,7 @@ Add to your MCP client config (e.g. `claude_desktop_config.json`):
 |------|-------------|------------|
 | `get_system_specs` | Node hardware info (RAM, GPU, CPU) | None |
 | `recommend_models` | Top models for this hardware | `limit?`, `use_case?`, `min_fit?`, `runtime?`, `license?`, `sort?` |
-| `search_models` | Free-text model search | `query`, `limit?` |
+| `search_models` | Free-text model search, best match first | `query`, `limit?`, `search_mode?` (`smart\|substring\|fuzzy\|regex`), `fuzz?` (`1`-`9`\|`off`), `rank_by_relevance?` |
 | `plan_hardware` | Hardware requirements for a model | `model`, `context?`, `quant?`, `target_tps?` |
 | `get_runtimes` | Installed inference runtimes | None |
 | `get_installed_models` | Models in local runtimes | None |

@@ -39,6 +39,18 @@ pub struct SearchModelsParams {
     pub query: String,
     /// Maximum number of results to return (default: 10)
     pub limit: Option<usize>,
+    /// How to interpret the query: "smart" (substring or subsequence per
+    /// space-separated term, the default), "substring" (every term verbatim),
+    /// "fuzzy" (subsequence per term) or "regex" (whole query is one
+    /// case-insensitive regular expression).
+    pub search_mode: Option<String>,
+    /// How loose a fuzzy match may be: "1" to "9", or "off" for no limit. A
+    /// match may span at most N times the term length, so 1 is contiguous-only
+    /// and higher is sloppier. Default "3". Only affects smart and fuzzy.
+    pub fuzz: Option<String>,
+    /// Return best matches first instead of highest hardware-fit score.
+    /// Defaults to true.
+    pub rank_by_relevance: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -164,32 +176,57 @@ impl LlmfitMcpServer {
     /// Search for models by name, provider, or use case
     #[tool(
         name = "search_models",
-        description = "Search for LLM models by name, provider, or use case"
+        description = "Search for LLM models by name, provider, or use case. \
+                       Set search_mode to smart (default), substring, fuzzy or regex."
     )]
     async fn search_models(&self, params: Parameters<SearchModelsParams>) -> String {
         let params = params.0;
         let limit = params.limit.unwrap_or(10);
-        let search_lower = params.query.to_lowercase();
+
+        let search_mode = match serve_shared::parse_search_mode(params.search_mode.as_deref()) {
+            Ok(mode) => mode,
+            Err(err) => {
+                return serde_json::to_string_pretty(&serde_json::json!({ "error": err }))
+                    .unwrap_or_default();
+            }
+        };
+
+        let fuzz = match serve_shared::parse_fuzz(params.fuzz.as_deref()) {
+            Ok(f) => f,
+            Err(err) => {
+                return serde_json::to_string_pretty(&serde_json::json!({ "error": err }))
+                    .unwrap_or_default();
+            }
+        };
+        let rank = params.rank_by_relevance.unwrap_or(true);
 
         let mut fits = self.analyze_all();
-        fits.retain(|f| {
-            f.model.name.to_lowercase().contains(&search_lower)
-                || f.model.provider.to_lowercase().contains(&search_lower)
-                || f.model
-                    .parameter_count
-                    .to_lowercase()
-                    .contains(&search_lower)
-                || f.model.use_case.to_lowercase().contains(&search_lower)
-                || f.use_case.label().to_lowercase().contains(&search_lower)
-        });
+        // Report a bad pattern instead of returning unfiltered rows that the
+        // caller would read as regex matches.
+        if let Some(err) =
+            serve_shared::retain_search_matches(&mut fits, &params.query, search_mode, fuzz)
+        {
+            return serde_json::to_string_pretty(&serde_json::json!({
+                "error": format!("invalid regex: {err}"),
+            }))
+            .unwrap_or_default();
+        }
         fits.retain(|f| f.fit_level != FitLevel::TooTight);
 
         let total = fits.len();
         let mut ranked = rank_models_by_fit_opts_col(fits, false, SortColumn::Score);
+        // Ranking runs last, over the fully filtered set; the fit-score sort
+        // above then acts as the tiebreak between equally good matches.
+        if rank {
+            serve_shared::sort_by_relevance(&mut ranked, &params.query, search_mode, fuzz);
+        }
         ranked.truncate(limit);
 
         let result = serde_json::json!({
             "query": params.query,
+            "search_mode": search_mode.label(),
+            "fuzz": fuzz.label(),
+            "ranked_by_relevance": rank,
             "total_matches": total,
             "returned_models": ranked.len(),
             "models": ranked.iter().map(serve_shared::fit_to_json).collect::<Vec<_>>(),

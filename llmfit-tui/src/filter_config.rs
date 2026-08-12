@@ -18,6 +18,14 @@ pub struct FilterConfig {
     pub sort_ascending: Option<bool>,
     pub installed_first: Option<bool>,
     pub search_query: Option<String>,
+    /// How the search query is interpreted: `smart`, `substring`, `fuzzy` or
+    /// `regex`. Unknown values fall back to the default rather than erroring,
+    /// so a hand-edited file never blocks startup.
+    pub search_mode: Option<String>,
+    /// Fuzzy-match tightness: `1`-`9` (multiple of the term length that the
+    /// match may span) or `off` for no limit. Unknown values fall back to the
+    /// default, like `search_mode`.
+    pub fuzz: Option<String>,
 
     // Multi-select popup filters: name → selected
     pub providers: Option<HashMap<String, bool>>,

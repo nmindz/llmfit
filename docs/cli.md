@@ -28,6 +28,21 @@ llmfit list
 # Search by name, provider, or size
 llmfit search "llama 8b"
 
+# Regex search (whole query is one case-insensitive pattern)
+llmfit --search-mode regex search "^llama-3\.[12]"
+
+# Fuzzy search (each term is an in-order subsequence)
+llmfit --search-mode fuzzy search "qw3c"
+
+# Modes: smart (default), substring, fuzzy, regex.
+# Also settable via LLMFIT_SEARCH_MODE.
+
+# Control fuzziness: a term may span at most N times its own length.
+# 1 = contiguous only, 3 = default, off = no limit. Also LLMFIT_FUZZ.
+llmfit --search-mode fuzzy --fuzz 2 search "qw3c"
+
+# Results are ranked best-match-first.
+
 # Detailed view of a single model
 llmfit info "Mistral-7B"
 
@@ -80,6 +95,12 @@ Supported query params for `models`/`models/top`:
 - `use_case`: `general|coding|reasoning|chat|multimodal|embedding`
 - `provider`: provider text filter (substring)
 - `search`: free-text filter across name/provider/size/use-case
+- `search_mode` (or `mode`): `smart|substring|fuzzy|regex` — how `search` is
+  interpreted (default `smart`). An invalid regex returns HTTP 400.
+- `fuzz`: `1`-`9` or `off` — how far apart a fuzzy match may be spread, as a
+  multiple of the term length (default `3`). Only affects `smart` and `fuzzy`.
+- `sort=relevance` (aliases `match`, `best`): order by match quality instead of
+  hardware-fit score.
 - `sort`: `score|tps|params|mem|ctx|date|use_case`
 - `include_too_tight`: include non-runnable rows (default `false` on `/top`, `true` on `/models`)
 - `max_context`: per-request context cap for memory estimation

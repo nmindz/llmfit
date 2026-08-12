@@ -523,6 +523,225 @@ fn fit_json_returns_empty_models_when_no_perfect_matches() {
     );
 }
 
+/// stdout of a successful `llmfit` run, as text.
+///
+/// Queries here must match the bundled catalog: on zero local hits `search`
+/// falls back to querying HuggingFace, which a test must never depend on.
+fn run_text_command(args: &[&str]) -> String {
+    let output = Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).expect("command output was not UTF-8")
+}
+
+#[test]
+fn search_defaults_to_smart_mode() {
+    let text = run_text_command(&["--no-dashboard", "search", "llama"]);
+    assert!(text.contains("Search Results for 'llama'"));
+    assert!(text.contains("Found "));
+}
+
+#[test]
+fn search_regex_mode_filters_by_pattern() {
+    let text = run_text_command(&["--no-dashboard", "--search-mode", "regex", "search", "^gpt"]);
+    assert!(
+        text.contains("Search Results for '^gpt'"),
+        "anchored pattern should match catalog entries: {text}"
+    );
+}
+
+#[test]
+fn search_substring_mode_rejects_what_regex_mode_matches() {
+    // `^gpt` is a pattern in regex mode and a literal in substring mode. No
+    // model name starts with a caret, so the literal reading finds nothing and
+    // falls through to the HuggingFace message rather than the results header.
+    let text = run_text_command(&[
+        "--no-dashboard",
+        "--search-mode",
+        "substring",
+        "search",
+        "^gpt",
+    ]);
+    assert!(
+        !text.contains("=== Search Results for"),
+        "substring mode must not interpret '^' as an anchor: {text}"
+    );
+}
+
+#[test]
+fn search_mode_is_read_from_the_environment() {
+    let output = Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .env("LLMFIT_SEARCH_MODE", "regex")
+        .args(["--no-dashboard", "search", "^gpt"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("command output was not UTF-8");
+    assert!(text.contains("Search Results for '^gpt'"));
+}
+
+#[test]
+fn search_rejects_an_invalid_regex_instead_of_guessing() {
+    let output = Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .args(["--no-dashboard", "--search-mode", "regex", "search", "gpt("])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let text = String::from_utf8(output).expect("stderr was not UTF-8");
+    assert!(text.contains("Invalid regex"), "stderr was: {text}");
+}
+
+#[test]
+fn search_rejects_an_unknown_search_mode() {
+    Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .args([
+            "--no-dashboard",
+            "--search-mode",
+            "nonsense",
+            "search",
+            "gpt",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn a_bad_search_mode_env_var_warns_but_does_not_break_the_program() {
+    // A stale or misspelled LLMFIT_SEARCH_MODE must not brick every
+    // invocation, including ones that never search.
+    let output = Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .env("LLMFIT_SEARCH_MODE", "bogus")
+        .args(["--no-dashboard", "--json", "system"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not UTF-8");
+    assert!(
+        stderr.contains("LLMFIT_SEARCH_MODE"),
+        "the ignored value should be reported: {stderr}"
+    );
+    serde_json::from_slice::<Value>(&output.stdout).expect("stdout should still be valid JSON");
+}
+
+#[test]
+fn search_mode_accepts_the_same_aliases_everywhere() {
+    // These also parse from filters.json, ?search_mode= and the MCP tool.
+    for alias in ["exact", "literal", "plain", "sub", "contains"] {
+        Command::cargo_bin("llmfit")
+            .expect("failed to locate llmfit test binary")
+            .args(["--no-dashboard", "--search-mode", alias, "search", "llama"])
+            .assert()
+            .success();
+    }
+}
+
+/// Number of models in a `llmfit search` results table.
+fn search_hits(text: &str) -> usize {
+    text.lines()
+        .find_map(|l| l.strip_prefix("Found "))
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+#[test]
+fn tighter_fuzz_returns_strictly_fewer_hits() {
+    let counts: Vec<usize> = ["2", "3", "5", "off"]
+        .iter()
+        .map(|f| {
+            search_hits(&run_text_command(&[
+                "--no-dashboard",
+                "--search-mode",
+                "fuzzy",
+                "--fuzz",
+                f,
+                "search",
+                "qw3c",
+            ]))
+        })
+        .collect();
+    assert!(counts[0] > 0, "fuzz=2 should still match something");
+    for pair in counts.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "looser fuzz must not return fewer hits: {counts:?}"
+        );
+    }
+}
+
+#[test]
+fn search_results_are_ranked_best_match_first() {
+    let text = run_text_command(&["--no-dashboard", "--search-mode", "fuzzy", "search", "qw3c"]);
+    // The first result row must be an actual Qwen3-Coder, not merely a model
+    // that happens to contain q, w, 3 and c in order.
+    let first = text
+        .lines()
+        .find(|l| l.starts_with("│ --"))
+        .expect("expected at least one result row");
+    assert!(
+        first.to_lowercase().contains("qwen3-coder"),
+        "top hit should be the best match, got: {first}"
+    );
+}
+
+#[test]
+fn a_bad_fuzz_flag_fails_but_a_bad_env_var_only_warns() {
+    Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .args(["--no-dashboard", "--fuzz", "99", "search", "llama"])
+        .assert()
+        .failure();
+
+    let output = Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .env("LLMFIT_FUZZ", "99")
+        .args(["--no-dashboard", "--json", "system"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not UTF-8");
+    assert!(stderr.contains("LLMFIT_FUZZ"), "stderr was: {stderr}");
+    serde_json::from_slice::<Value>(&output.stdout).expect("stdout should still be valid JSON");
+}
+
+#[test]
+fn a_blank_search_env_var_is_treated_as_unset() {
+    // `LLMFIT_FUZZ=` is *set* but configures nothing. It must not warn, and
+    // must not be treated as an explicit override — the TUI would otherwise
+    // silently reset the tightness saved in filters.json.
+    for var in ["LLMFIT_FUZZ", "LLMFIT_SEARCH_MODE"] {
+        let output = Command::cargo_bin("llmfit")
+            .expect("failed to locate llmfit test binary")
+            .env(var, "")
+            .args(["--no-dashboard", "--json", "system"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr).expect("stderr was not UTF-8");
+        assert!(
+            !stderr.contains(var),
+            "a blank {var} should be silently ignored, got: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn fit_show_incompatible_includes_non_runnable_models() {
     let mut args = vec![

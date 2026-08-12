@@ -8,6 +8,7 @@ use llmfit_core::providers::{
     command_exists,
 };
 use llmfit_core::quality;
+use llmfit_core::search::{Fuzz, Matcher, SearchMode};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
@@ -813,24 +814,49 @@ fn sort_column_from_label(s: &str) -> SortColumn {
     }
 }
 
+/// Runs `f` with the row's searchable fields, most identifying first.
+///
+/// One definition shared by the match pass and the relevance-scoring pass, so
+/// the two can never drift into scoring a different set of fields than they
+/// filtered on. Field order is load-bearing: `Matcher::score_fields` weights
+/// earlier fields higher, so the model name must stay first.
+fn with_search_fields<R>(fit: &ModelFit, f: impl FnOnce([&str; 8]) -> R) -> R {
+    let caps_text = fit
+        .model
+        .capabilities
+        .iter()
+        .map(|c| c.label())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let gguf_text = fit
+        .model
+        .gguf_sources
+        .iter()
+        .map(|gs| format!("{} {}", gs.repo, gs.provider))
+        .collect::<Vec<_>>()
+        .join(" ");
+    f([
+        fit.model.name.as_str(),
+        fit.model.provider.as_str(),
+        fit.model.parameter_count.as_str(),
+        fit.model.use_case.as_str(),
+        fit.use_case.label(),
+        caps_text.as_str(),
+        fit.model.license.as_deref().unwrap_or(""),
+        gguf_text.as_str(),
+    ])
+}
+
 /// Case-insensitive subsequence ("fuzzy") match: returns true when every
 /// character of `query` appears in `candidate` in order (not necessarily
 /// contiguous). An empty query matches everything.
+///
+/// The provider popup is deliberately always-fuzzy rather than following
+/// [`App::search_mode`] — it is a short picker over ~20 known names, where
+/// regex and verbatim substring buy nothing. This delegates to the shared
+/// matcher so there is one subsequence implementation in the tree.
 fn fuzzy_match(query: &str, candidate: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-    let mut q = query.chars().flat_map(char::to_lowercase).peekable();
-    for c in candidate.chars().flat_map(char::to_lowercase) {
-        if let Some(&qc) = q.peek() {
-            if c == qc {
-                q.next();
-            }
-        } else {
-            break;
-        }
-    }
-    q.peek().is_none()
+    Matcher::new(query, SearchMode::Fuzzy).matches(candidate)
 }
 
 /// Whether `name` is one of the currently selected entries of the provider filter.
@@ -870,6 +896,16 @@ pub struct App {
     pub input_mode: InputMode,
     pub search_query: String,
     pub cursor_position: usize,
+    /// How `search_query` (and the leaderboard `/` query) is interpreted.
+    pub search_mode: SearchMode,
+    /// How loose a fuzzy/smart subsequence match may be.
+    pub fuzz: Fuzz,
+    /// Relevance score per `all_fits` index for the active query. Keyed by
+    /// index rather than parallel to `filtered_fits` so it survives reordering.
+    pub search_scores: HashMap<usize, i32>,
+    /// Set when the current query is an invalid regex. The matcher degrades to
+    /// smart matching in that case; this is what tells the user it happened.
+    pub search_error: Option<String>,
 
     // Data
     pub specs: SystemSpecs,
@@ -1413,6 +1449,18 @@ impl App {
         let installed_first = saved.installed_first.unwrap_or(false);
         let search_query = saved.search_query.clone().unwrap_or_default();
         let cursor_position = search_query.len();
+        // An unparseable saved mode (hand-edited config, or a mode removed in a
+        // later release) must not stop the TUI from starting.
+        let search_mode = saved
+            .search_mode
+            .as_deref()
+            .and_then(|s| s.parse::<SearchMode>().ok())
+            .unwrap_or_default();
+        let fuzz = saved
+            .fuzz
+            .as_deref()
+            .and_then(|s| s.parse::<Fuzz>().ok())
+            .unwrap_or_default();
 
         if let Some(ref map) = saved.providers {
             FilterConfig::apply_map(&model_providers, &mut selected_providers, map);
@@ -1456,6 +1504,10 @@ impl App {
             input_mode: InputMode::Normal,
             search_query,
             cursor_position,
+            search_mode,
+            fuzz,
+            search_scores: HashMap::new(),
+            search_error: None,
             specs,
             all_fits,
             filtered_fits: (0..filtered_count).collect(),
@@ -1730,6 +1782,8 @@ impl App {
             sort_column: Some(self.table_sort_label().to_string()),
             sort_ascending: Some(self.sort_ascending),
             installed_first: Some(self.installed_first),
+            search_mode: Some(self.search_mode.label().to_string()),
+            fuzz: Some(self.fuzz.label()),
             search_query: if self.search_query.is_empty() {
                 None
             } else {
@@ -1792,55 +1846,22 @@ impl App {
     }
 
     pub fn apply_filters(&mut self) {
-        let query = self.search_query.to_lowercase();
-        // Split query into space-separated terms for fuzzy matching
-        let terms: Vec<&str> = query.split_whitespace().collect();
-
-        let term_matches_model = |term: &str, fit: &ModelFit| -> bool {
-            if fit.model.name.to_lowercase().contains(term) {
-                return true;
-            }
-            if fit.model.provider.to_lowercase().contains(term) {
-                return true;
-            }
-            if fit.model.parameter_count.to_lowercase().contains(term) {
-                return true;
-            }
-            if fit.model.use_case.to_lowercase().contains(term) {
-                return true;
-            }
-            if fit.use_case.label().to_lowercase().contains(term) {
-                return true;
-            }
-            if fit
-                .model
-                .capabilities
-                .iter()
-                .any(|c| c.label().to_lowercase().contains(term))
-            {
-                return true;
-            }
-            if let Some(lic) = &fit.model.license {
-                if lic.to_lowercase().contains(term) {
-                    return true;
-                }
-            }
-            fit.model.gguf_sources.iter().any(|gs| {
-                gs.repo.to_lowercase().contains(term) || gs.provider.to_lowercase().contains(term)
-            })
-        };
+        // Compile the query once, outside the row loop — in regex mode that
+        // keeps pattern compilation off the per-row path.
+        let matcher = Matcher::with_fuzz(&self.search_query, self.search_mode, self.fuzz);
+        self.search_error = matcher.error().map(str::to_string);
+        // Scoring costs more than a plain match test, so only pay for it when
+        // the results are actually going to be ordered by relevance.
+        let rank_by_relevance = self.sort_column == SortColumn::Relevance && !matcher.is_empty();
+        let mut scores: HashMap<usize, i32> = HashMap::new();
 
         self.filtered_fits = self
             .all_fits
             .iter()
             .enumerate()
             .filter(|(_, fit)| {
-                // Search filter: all terms must match (fuzzy/AND logic)
-                let matches_search = if terms.is_empty() {
-                    true
-                } else {
-                    terms.iter().all(|term| term_matches_model(term, fit))
-                };
+                let matches_search = matcher.is_empty()
+                    || with_search_fields(fit, |fields| matcher.matches_fields(fields));
 
                 // Provider filter (check primary provider and GGUF source providers)
                 let matches_provider = matches_provider_filter(&fit.model, |provider| {
@@ -2041,6 +2062,38 @@ impl App {
 
         self.table_follow_selection = true;
         self.last_model_click = None;
+        if rank_by_relevance {
+            // Only the rows that survived every filter get scored, so the cost
+            // tracks the result count rather than the whole catalog.
+            for &idx in &self.filtered_fits {
+                let fit = &self.all_fits[idx];
+                if let Some(score) = with_search_fields(fit, |fields| matcher.score_fields(fields))
+                {
+                    scores.insert(idx, score);
+                }
+            }
+            // Keep the invariants the column sorts already guarantee —
+            // installed-first (when on) and unrunnable-last — and rank by
+            // match quality only within those groups. `sort_by_key` is stable,
+            // so equal scores keep the underlying sort order as a tiebreak.
+            let installed_first = self.installed_first;
+            let all = &self.all_fits;
+            let ascending = self.sort_ascending;
+            self.filtered_fits.sort_by_key(|&idx| {
+                let fit = &all[idx];
+                let not_installed = u8::from(installed_first && !fit.installed);
+                let not_runnable = u8::from(fit.fit_level == FitLevel::TooTight);
+                let score = scores.get(&idx).copied().unwrap_or(i32::MIN);
+                // Negated so the highest score sorts first.
+                (
+                    not_installed,
+                    not_runnable,
+                    if ascending { score } else { -score },
+                )
+            });
+        }
+        self.search_scores = scores;
+
         // Clamp selection
         if self.filtered_fits.is_empty() {
             self.selected_row = 0;
@@ -2203,6 +2256,57 @@ impl App {
 
     pub fn enter_search(&mut self) {
         self.input_mode = InputMode::Search;
+    }
+
+    /// Cycle how the query is interpreted (smart → substring → fuzzy → regex).
+    /// Re-filters immediately so the effect of the new mode is visible without
+    /// retyping, and persists the choice for the next run.
+    pub fn cycle_search_mode(&mut self) {
+        self.set_search_mode(self.search_mode.next());
+    }
+
+    /// Step to the next fuzzy-tightness rung, wrapping.
+    pub fn cycle_fuzz(&mut self) {
+        self.set_fuzz(self.fuzz.cycle());
+    }
+
+    /// Loosen the fuzzy tightness by one step (more, sloppier matches).
+    pub fn loosen_fuzz(&mut self) {
+        self.set_fuzz(self.fuzz.looser());
+    }
+
+    /// Tighten the fuzzy tightness by one step (fewer, closer matches).
+    pub fn tighten_fuzz(&mut self) {
+        self.set_fuzz(self.fuzz.tighter());
+    }
+
+    pub fn set_fuzz(&mut self, fuzz: Fuzz) {
+        self.fuzz = fuzz;
+        self.selected_row = 0;
+        self.bench_cursor = 0;
+        self.bench_scroll = 0;
+        self.apply_filters();
+    }
+
+    /// Whether the tightness knob currently affects anything. Substring and
+    /// regex have no gapped matching to loosen.
+    pub fn fuzz_is_active(&self) -> bool {
+        matches!(self.search_mode, SearchMode::Smart | SearchMode::Fuzzy)
+    }
+
+    pub fn cycle_search_mode_back(&mut self) {
+        self.set_search_mode(self.search_mode.prev());
+    }
+
+    /// Switches mode and re-filters immediately, so the effect is visible
+    /// without retyping. Not persisted here: like every other filter, the mode
+    /// is written to `filters.json` on quit.
+    pub fn set_search_mode(&mut self, mode: SearchMode) {
+        self.search_mode = mode;
+        self.selected_row = 0;
+        self.bench_cursor = 0;
+        self.bench_scroll = 0;
+        self.apply_filters();
     }
 
     pub fn exit_search(&mut self) {
@@ -2881,30 +2985,29 @@ impl App {
         }
     }
 
-    /// Indices into `bench_entries` that match the `/` search. Same semantics
-    /// as the main table search: space-separated terms, all must appear
-    /// (case-insensitive) somewhere in the row's searchable text.
+    /// Indices into `bench_entries` that match the `/` search. Shares the main
+    /// table's matcher, so the active [`SearchMode`] applies here too.
     pub fn bench_visible_indices(&self) -> Vec<usize> {
-        let query = self.bench_search_query.to_lowercase();
-        let terms: Vec<&str> = query.split_whitespace().collect();
+        let matcher = Matcher::with_fuzz(&self.bench_search_query, self.search_mode, self.fuzz);
+        if matcher.is_empty() {
+            return (0..self.bench_entries.len()).collect();
+        }
         self.bench_entries
             .iter()
             .enumerate()
             .filter(|(_, e)| {
-                if terms.is_empty() {
-                    return true;
-                }
-                let haystack = format!(
-                    "{} {} {} {}",
-                    e.hf_id().to_lowercase(),
-                    e.engine_name().to_lowercase(),
-                    e.quantization().to_lowercase(),
-                    e.username().to_lowercase(),
-                );
-                terms.iter().all(|t| haystack.contains(t))
+                matcher.matches_fields([e.hf_id(), e.engine_name(), e.quantization(), e.username()])
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// The regex error for the leaderboard query, if any. Computed on demand:
+    /// unlike the main table there is no filter pass to hang it off.
+    pub fn bench_search_error(&self) -> Option<String> {
+        Matcher::with_fuzz(&self.bench_search_query, self.search_mode, self.fuzz)
+            .error()
+            .map(str::to_string)
     }
 
     pub fn bench_search_start(&mut self) {
@@ -3518,17 +3621,22 @@ impl App {
         }
     }
 
-    pub fn sorted_table_column(&self) -> usize {
-        self.header_sort_column.unwrap_or(match self.sort_column {
-            SortColumn::Provider => 3,
-            SortColumn::Params => 4,
-            SortColumn::Score => 5,
-            SortColumn::Tps => 6,
-            SortColumn::MemPct => 10,
-            SortColumn::Ctx => 11,
-            SortColumn::ReleaseDate => 12,
-            SortColumn::UseCase => 14,
-        })
+    /// `None` for Relevance: it has no column of its own, it reorders rows.
+    pub fn sorted_table_column(&self) -> Option<usize> {
+        if self.header_sort_column.is_some() {
+            return self.header_sort_column;
+        }
+        match self.sort_column {
+            SortColumn::Relevance => None,
+            SortColumn::Provider => Some(3),
+            SortColumn::Params => Some(4),
+            SortColumn::Score => Some(5),
+            SortColumn::Tps => Some(6),
+            SortColumn::MemPct => Some(10),
+            SortColumn::Ctx => Some(11),
+            SortColumn::ReleaseDate => Some(12),
+            SortColumn::UseCase => Some(14),
+        }
     }
 
     pub fn table_sort_label(&self) -> &str {
@@ -3548,7 +3656,7 @@ impl App {
     }
 
     pub fn table_sort_direction_is_ascending(&self, reversed: bool) -> bool {
-        if matches!(self.sorted_table_column(), 2 | 3 | 7 | 9 | 13 | 14) {
+        if matches!(self.sorted_table_column(), Some(2 | 3 | 7 | 9 | 13 | 14)) {
             !reversed // These columns default to A-Z / best fit first
         } else {
             reversed
@@ -5902,6 +6010,8 @@ mod tests {
         app.header_sort_column = None;
         app.search_query.clear();
         app.cursor_position = 0;
+        app.search_mode = SearchMode::default();
+        app.search_error = None;
         app.fit_filter = FitFilter::All;
         app.availability_filter = AvailabilityFilter::All;
         app.tp_filter = TpFilter::All;
@@ -5984,6 +6094,283 @@ mod tests {
         app.search_input('z');
         assert!(app.filtered_fits.is_empty());
         assert_eq!(app.selected_row, 0);
+    }
+
+    /// Three models plus the boilerplate `apply_filters` needs, for the
+    /// search-mode tests below.
+    fn search_mode_app() -> App {
+        let mut app = test_app();
+        clear_persisted_filters(&mut app);
+        app.all_fits = vec![
+            test_fit("gemma-2b", FitLevel::Good, 90.0),
+            test_fit("gemma-7b", FitLevel::Good, 80.0),
+            test_fit("llama-7b", FitLevel::Good, 70.0),
+        ];
+        app.providers = vec!["Test".to_string()];
+        app.selected_providers = vec![true];
+        app.apply_filters();
+        app
+    }
+
+    fn matched_names(app: &App) -> Vec<String> {
+        app.filtered_fits
+            .iter()
+            .map(|&i| app.all_fits[i].model.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn search_mode_defaults_to_smart() {
+        assert_eq!(test_app().search_mode, SearchMode::Smart);
+    }
+
+    #[test]
+    fn smart_mode_matches_gapped_queries_substring_mode_rejects() {
+        let mut app = search_mode_app();
+        app.search_query = "gm7".to_string();
+
+        app.set_search_mode(SearchMode::Smart);
+        assert_eq!(matched_names(&app), vec!["gemma-7b"]);
+
+        // Substring mode is the pre-existing behaviour: no gaps allowed.
+        app.set_search_mode(SearchMode::Substring);
+        assert!(app.filtered_fits.is_empty());
+    }
+
+    #[test]
+    fn fuzzy_mode_matches_subsequence_across_terms() {
+        let mut app = search_mode_app();
+        app.set_search_mode(SearchMode::Fuzzy);
+
+        app.search_query = "gm7".to_string();
+        app.apply_filters();
+        assert_eq!(matched_names(&app), vec!["gemma-7b"]);
+
+        // Both terms must match — AND, not OR.
+        app.search_query = "gm 9".to_string();
+        app.apply_filters();
+        assert!(app.filtered_fits.is_empty());
+    }
+
+    #[test]
+    fn regex_mode_filters_by_pattern() {
+        let mut app = search_mode_app();
+        app.set_search_mode(SearchMode::Regex);
+
+        app.search_query = "^gemma".to_string();
+        app.apply_filters();
+        assert_eq!(matched_names(&app), vec!["gemma-2b", "gemma-7b"]);
+
+        app.search_query = r"-(2|7)b$".to_string();
+        app.apply_filters();
+        assert_eq!(app.filtered_fits.len(), 3);
+
+        assert!(app.search_error.is_none());
+    }
+
+    #[test]
+    fn invalid_regex_reports_an_error_without_emptying_the_table() {
+        let mut app = search_mode_app();
+        app.set_search_mode(SearchMode::Regex);
+
+        app.search_query = "gemma(".to_string();
+        app.apply_filters();
+
+        assert!(
+            app.search_error.is_some(),
+            "an unapplied filter must be reported, not silent"
+        );
+        // A half-typed pattern stops filtering instead of blanking the table.
+        assert_eq!(app.filtered_fits.len(), 3);
+
+        // Completing the pattern clears the error and applies the filter.
+        app.search_query = "gemma(-2b)?".to_string();
+        app.apply_filters();
+        assert!(app.search_error.is_none());
+        assert_eq!(matched_names(&app), vec!["gemma-2b", "gemma-7b"]);
+    }
+
+    #[test]
+    fn search_error_clears_when_leaving_regex_mode() {
+        let mut app = search_mode_app();
+        app.search_query = "gemma(".to_string();
+        app.set_search_mode(SearchMode::Regex);
+        assert!(app.search_error.is_some());
+
+        app.set_search_mode(SearchMode::Smart);
+        assert!(app.search_error.is_none());
+    }
+
+    #[test]
+    fn cycling_search_mode_wraps_and_reverses() {
+        let mut app = search_mode_app();
+        assert_eq!(app.search_mode, SearchMode::Smart);
+
+        let cycled: Vec<SearchMode> = (0..SearchMode::ALL.len())
+            .map(|_| {
+                app.cycle_search_mode();
+                app.search_mode
+            })
+            .collect();
+        assert_eq!(*cycled.last().unwrap(), SearchMode::Smart, "must wrap");
+        for mode in SearchMode::ALL {
+            assert!(cycled.contains(&mode), "{mode} never reached");
+        }
+
+        app.cycle_search_mode_back();
+        assert_eq!(app.search_mode, SearchMode::Regex);
+    }
+
+    #[test]
+    fn changing_search_mode_resets_selection_and_refilters() {
+        let mut app = search_mode_app();
+        app.search_query = "gm7".to_string();
+        app.set_search_mode(SearchMode::Smart);
+        assert_eq!(app.filtered_fits.len(), 1);
+
+        app.selected_row = 0;
+        app.set_search_mode(SearchMode::Substring);
+        // Re-filtered without needing another keystroke.
+        assert!(app.filtered_fits.is_empty());
+        assert_eq!(app.selected_row, 0);
+    }
+
+    #[test]
+    fn search_mode_round_trips_through_the_saved_config() {
+        for mode in SearchMode::ALL {
+            let restored = Some(mode.label().to_string())
+                .as_deref()
+                .and_then(|s| s.parse::<SearchMode>().ok())
+                .unwrap_or_default();
+            assert_eq!(restored, mode);
+        }
+
+        // A hand-edited or stale value must not stop the TUI from starting.
+        let restored = Some("no-such-mode".to_string())
+            .as_deref()
+            .and_then(|s| s.parse::<SearchMode>().ok())
+            .unwrap_or_default();
+        assert_eq!(restored, SearchMode::default());
+    }
+
+    #[test]
+    fn fuzz_defaults_and_persists_through_the_saved_config() {
+        assert_eq!(test_app().fuzz, Fuzz::default());
+        for fuzz in Fuzz::LADDER {
+            let restored = Some(fuzz.label())
+                .as_deref()
+                .and_then(|s| s.parse::<Fuzz>().ok())
+                .unwrap_or_default();
+            assert_eq!(restored, fuzz);
+        }
+        // A hand-edited or stale value must not stop the TUI from starting.
+        let restored = Some("wat".to_string())
+            .as_deref()
+            .and_then(|s| s.parse::<Fuzz>().ok())
+            .unwrap_or_default();
+        assert_eq!(restored, Fuzz::default());
+    }
+
+    #[test]
+    fn tightening_fuzz_narrows_the_result_set() {
+        let mut app = search_mode_app();
+        app.search_query = "gm7".to_string();
+        app.set_search_mode(SearchMode::Fuzzy);
+
+        app.set_fuzz(Fuzz::MaxSpan(3));
+        assert_eq!(matched_names(&app), vec!["gemma-7b"]);
+
+        // gemma-7b needs a window of 7 for a 3-char term, so 2x drops it.
+        app.set_fuzz(Fuzz::MaxSpan(2));
+        assert!(app.filtered_fits.is_empty());
+
+        app.set_fuzz(Fuzz::Unlimited);
+        assert!(!app.filtered_fits.is_empty());
+    }
+
+    #[test]
+    fn fuzz_never_narrows_a_substring_match() {
+        let mut app = search_mode_app();
+        app.search_query = "gemma".to_string();
+        app.set_search_mode(SearchMode::Smart);
+        for n in Fuzz::MIN..=Fuzz::MAX {
+            app.set_fuzz(Fuzz::MaxSpan(n));
+            assert_eq!(
+                matched_names(&app),
+                vec!["gemma-2b", "gemma-7b"],
+                "fuzz {n} dropped a contiguous match"
+            );
+        }
+    }
+
+    #[test]
+    fn cycling_fuzz_wraps_through_the_ladder() {
+        let mut app = search_mode_app();
+        app.set_fuzz(Fuzz::LADDER[0]);
+        let seen: Vec<Fuzz> = (0..Fuzz::LADDER.len())
+            .map(|_| {
+                app.cycle_fuzz();
+                app.fuzz
+            })
+            .collect();
+        assert_eq!(*seen.last().unwrap(), Fuzz::LADDER[0], "must wrap");
+        for rung in Fuzz::LADDER {
+            assert!(seen.contains(&rung), "{rung} never reached");
+        }
+    }
+
+    #[test]
+    fn fuzz_is_only_advertised_for_modes_that_use_it() {
+        let mut app = search_mode_app();
+        for (mode, expected) in [
+            (SearchMode::Smart, true),
+            (SearchMode::Fuzzy, true),
+            (SearchMode::Substring, false),
+            (SearchMode::Regex, false),
+        ] {
+            app.set_search_mode(mode);
+            assert_eq!(app.fuzz_is_active(), expected, "{mode}");
+        }
+    }
+
+    #[test]
+    fn relevance_sort_puts_the_best_match_first() {
+        let mut app = search_mode_app();
+        // Catalog order is gemma-2b, gemma-7b, llama-7b; by score the exact
+        // prefix "llama" should win regardless of that order.
+        app.sort_column = SortColumn::Relevance;
+        app.search_query = "llama".to_string();
+        app.apply_filters();
+        assert_eq!(
+            matched_names(&app).first().map(String::as_str),
+            Some("llama-7b")
+        );
+        assert!(!app.search_scores.is_empty(), "scores must be recorded");
+    }
+
+    #[test]
+    fn relevance_sort_is_inert_without_a_query() {
+        let mut app = search_mode_app();
+        app.sort_column = SortColumn::Relevance;
+        app.search_query.clear();
+        app.apply_filters();
+        // Untouched catalog order, and no scoring work done.
+        assert_eq!(
+            matched_names(&app),
+            vec!["gemma-2b", "gemma-7b", "llama-7b"]
+        );
+        assert!(app.search_scores.is_empty());
+    }
+
+    #[test]
+    fn other_sort_columns_keep_their_order_when_a_query_is_active() {
+        let mut app = search_mode_app();
+        app.sort_column = SortColumn::Score;
+        app.search_query = "gemma".to_string();
+        app.apply_filters();
+        // Relevance must not hijack an explicitly chosen column.
+        assert_eq!(matched_names(&app), vec!["gemma-2b", "gemma-7b"]);
+        assert!(app.search_scores.is_empty(), "no scoring unless ranking");
     }
 
     /// Build an app with one installed model, primed so open_benchmarks
@@ -6181,6 +6568,47 @@ mod tests {
 
         app.bench_search_query = "nomatch".to_string();
         assert!(app.bench_visible_indices().is_empty());
+    }
+
+    #[test]
+    fn bench_search_honors_the_active_search_mode() {
+        let mut app = test_app();
+        app.bench_entries = vec![
+            bench_entry("1", "meta-llama/Llama-3.1-8B", "ollama", "alice"),
+            bench_entry("2", "Qwen/Qwen2.5-7B", "llama.cpp", "bob"),
+            bench_entry("3", "meta-llama/Llama-3.1-70B", "vllm", "carol"),
+        ];
+
+        // Regex applies to the leaderboard as well as the model table.
+        app.search_mode = SearchMode::Regex;
+        app.bench_search_query = "llama-3\\.1-\\d+b$".to_string();
+        assert_eq!(app.bench_visible_indices(), vec![0, 2]);
+        assert!(app.bench_search_error().is_none());
+
+        // Subsequence across a gap: substring mode rejects, fuzzy accepts.
+        app.bench_search_query = "qwn".to_string();
+        app.search_mode = SearchMode::Substring;
+        assert!(app.bench_visible_indices().is_empty());
+        app.search_mode = SearchMode::Fuzzy;
+        assert_eq!(app.bench_visible_indices(), vec![1]);
+    }
+
+    #[test]
+    fn bench_search_surfaces_invalid_regex_without_emptying_the_list() {
+        let mut app = test_app();
+        app.bench_entries = vec![
+            bench_entry("1", "meta-llama/Llama-3.1-8B", "ollama", "alice"),
+            bench_entry("2", "Qwen/Qwen2.5-7B", "llama.cpp", "bob"),
+        ];
+        app.search_mode = SearchMode::Regex;
+        app.bench_search_query = "llama(".to_string();
+
+        assert!(app.bench_search_error().is_some());
+        assert_eq!(
+            app.bench_visible_indices(),
+            vec![0, 1],
+            "must not hide rows"
+        );
     }
 
     #[test]

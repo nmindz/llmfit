@@ -1,5 +1,80 @@
 use llmfit_core::fit::{FitLevel, InferenceRuntime, ModelFit, RunMode};
 use llmfit_core::hardware::SystemSpecs;
+use llmfit_core::search::{Fuzz, Matcher, SearchMode};
+
+/// Drop every fit that does not match `query` under `mode`.
+///
+/// Shared by the HTTP API's `?search=` filter and the MCP `search_models`
+/// tool, which were byte-identical copies of the same predicate.
+///
+/// Filtering only — call [`sort_by_relevance`] afterwards to order the
+/// survivors by match quality.
+///
+/// Returns the matcher's error message when a [`SearchMode::Regex`] pattern
+/// failed to compile. No filtering happens in that case, so callers should
+/// report the message rather than pass off unfiltered rows as matches.
+pub fn retain_search_matches(
+    fits: &mut Vec<ModelFit>,
+    query: &str,
+    mode: SearchMode,
+    fuzz: Fuzz,
+) -> Option<String> {
+    // Compiled once, outside the retain closure.
+    let matcher = Matcher::with_fuzz(query, mode, fuzz);
+    if matcher.is_empty() {
+        return matcher.error().map(str::to_string);
+    }
+    fits.retain(|f| search_fields(f, |fields| matcher.matches_fields(fields)));
+    matcher.error().map(str::to_string)
+}
+
+/// Reorder `fits` best-match-first for `query`.
+///
+/// Deliberately separate from [`retain_search_matches`] so ranking always
+/// runs *after* every other filter. Folding the two together invites the
+/// caller to return early to preserve the order, silently skipping the
+/// filters in between — exactly the bug this split exists to prevent.
+pub fn sort_by_relevance(fits: &mut [ModelFit], query: &str, mode: SearchMode, fuzz: Fuzz) {
+    let matcher = Matcher::with_fuzz(query, mode, fuzz);
+    if matcher.is_empty() {
+        return;
+    }
+    // Stable, so equal scores keep the order the column sort established.
+    fits.sort_by_key(|f| {
+        -search_fields(f, |fields| matcher.score_fields(fields)).unwrap_or(i32::MIN + 1)
+    });
+}
+
+/// The searchable fields of a fit, most identifying first — `score_fields`
+/// weights earlier fields higher, so the name must stay in front.
+fn search_fields<R>(f: &ModelFit, run: impl FnOnce([&str; 5]) -> R) -> R {
+    run([
+        f.model.name.as_str(),
+        f.model.provider.as_str(),
+        f.model.parameter_count.as_str(),
+        f.model.use_case.as_str(),
+        f.use_case.label(),
+    ])
+}
+
+/// Parses a `fuzz` request parameter, falling back to the default when absent.
+pub fn parse_fuzz(raw: Option<&str>) -> Result<Fuzz, String> {
+    match raw {
+        None => Ok(Fuzz::default()),
+        Some(value) => value.parse(),
+    }
+}
+
+/// Parses a `search_mode` request parameter, falling back to the default when
+/// absent. An unrecognised value is an error the caller should report rather
+/// than silently ignore — a client asking for `regex` and quietly getting
+/// substring results would be misled.
+pub fn parse_search_mode(raw: Option<&str>) -> Result<SearchMode, String> {
+    match raw {
+        None => Ok(SearchMode::default()),
+        Some(value) => value.parse(),
+    }
+}
 
 pub fn system_json(specs: &SystemSpecs) -> serde_json::Value {
     let gpus_json: Vec<serde_json::Value> = specs

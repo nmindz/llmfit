@@ -2,6 +2,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
+use crate::search::{Fuzz, Matcher, SearchMode};
+
 /// Quantization levels ordered from best quality to most compressed.
 /// Used for dynamic quantization selection: try the best that fits.
 pub const QUANT_HIERARCHY: &[&str] = &["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q3_K_M", "Q2_K"];
@@ -2280,16 +2282,47 @@ impl ModelDatabase {
         &self.models
     }
 
+    /// Free-text lookup across name, provider and parameter count, using the
+    /// default [`SearchMode`].
     pub fn find_model(&self, query: &str) -> Vec<&LlmModel> {
-        let query_lower = query.to_lowercase();
-        self.models
-            .iter()
-            .filter(|m| {
-                m.name.to_lowercase().contains(&query_lower)
-                    || m.provider.to_lowercase().contains(&query_lower)
-                    || m.parameter_count.to_lowercase().contains(&query_lower)
-            })
+        self.find_model_with_mode(query, SearchMode::default())
+    }
+
+    /// Free-text lookup with an explicit [`SearchMode`], so `llmfit search` can
+    /// offer the same regex/fuzzy interpretations the TUI does.
+    pub fn find_model_with_mode(&self, query: &str, mode: SearchMode) -> Vec<&LlmModel> {
+        self.find_model_ranked(query, mode, Fuzz::default())
+            .into_iter()
+            .map(|(m, _)| m)
             .collect()
+    }
+
+    /// Free-text lookup returning each match with its relevance score, best
+    /// first. Ties keep catalog order, so the result is deterministic.
+    pub fn find_model_ranked(
+        &self,
+        query: &str,
+        mode: SearchMode,
+        fuzz: Fuzz,
+    ) -> Vec<(&LlmModel, i32)> {
+        // Compiled once, then reused for every row.
+        let matcher = Matcher::with_fuzz(query, mode, fuzz);
+        let mut hits: Vec<(&LlmModel, i32)> = self
+            .models
+            .iter()
+            .filter_map(|m| {
+                let fields = [
+                    m.name.as_str(),
+                    m.provider.as_str(),
+                    m.parameter_count.as_str(),
+                ];
+                matcher.score_fields(fields).map(|score| (m, score))
+            })
+            .collect();
+        // Negated so the best score comes first; stable, so ties keep
+        // catalog order and the result stays deterministic.
+        hits.sort_by_key(|(_, score)| -score);
+        hits
     }
 
     pub fn models_fitting_system(

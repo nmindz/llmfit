@@ -239,6 +239,8 @@ llmfit fit                    # table of all models ranked by fit
 llmfit fit --show-incompatible # also show backend-incompatible models as non-runnable
 llmfit recommend --json       # top picks as JSON (agent/script consumption)
 llmfit info "<model>"         # one model: fit analysis, estimate basis, verify commands
+llmfit --search-mode regex search '^llama-3\.[12]'   # also: smart (default), substring, fuzzy
+llmfit --search-mode fuzzy --fuzz 2 search 'qw3c'    # tune fuzziness; results ranked best-first
 llmfit bench                  # measure real tok/s/TTFT against your running provider
 llmfit doctor                 # hardware detection report for bug reports
 llmfit serve                  # start the api and web user interface
