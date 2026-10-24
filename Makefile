@@ -19,7 +19,7 @@ help:
 	@echo "  make fmt            - Format code with rustfmt"
 	@echo "  make clippy         - Run clippy linter"
 	@echo "  make clean          - Remove build artifacts"
-	@echo "  make install        - Install release binary to ~/.cargo/bin"
+	@echo "  make install        - Install release binary to ~/.local/bin (PREFIX=...)"
 	@echo ""
 
 # Build debug version
@@ -71,6 +71,7 @@ fmt:
 clippy:
 	cargo clippy -- -D warnings
 
-# Install to ~/.cargo/bin
+# Install the release binary to $(PREFIX)/bin (default ~/.local/bin)
+PREFIX ?= $(HOME)/.local
 install:
-	cargo install --path .
+	cargo install --locked --force --path llmfit-tui --root $(PREFIX)
